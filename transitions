@@ -95,6 +95,8 @@ p +
 
 library(survival)
 library(haven)
+#Note: See the Stata code for calculating inverse probability weights in /calcweights
+
 Pathways_long_weights <- read_dta("C:/Users/llb296/OneDrive - University of Saskatchewan/Pathways/Pathways_long_weights.dta")
 
 #Remove Stata formats
