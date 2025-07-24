@@ -1,3 +1,5 @@
+#Stata code for calculating the propensity to have complete baseline data
+#This will be used for the weighted Cox regression in R
 
 use "C:\Users\llb296\OneDrive - University of Saskatchewan\Pathways\Pathways_weighting.dta"
 merge 1:1 CASEID using "C:\Users\llb296\OneDrive - University of Saskatchewan\Pathways\ICPSR_29961\DS0001\29961-0001-Data.dta", keepusing(S0ETHN_R S0DEM26 S0HOOD S0NBPHOM S0SIGOTH S0REL197 S0NUM_MH)
@@ -16,3 +18,4 @@ save, replace
 
 use "C:\Users\llb296\OneDrive - University of Saskatchewan\Pathways\Pathways_long.dta"
 merge m:1 CASEID using "C:\Users\llb296\OneDrive - University of Saskatchewan\Pathways\Pathways_weighting.dta", keepusing(S0ETHN_R S0DEM26 S0HOOD S0NBPHOM S0SIGOTH S0REL197 S0NUM_MH S0MAHOTL inv_prob)
+save, replace
