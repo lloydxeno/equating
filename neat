@@ -1,0 +1,560 @@
+library(equate)
+library(haven)
+setwd("C:/Users/llb296/OneDrive - University of Saskatchewan/Pathways/Oct_2025")
+
+
+library(haven)
+pclypi_wide <- read_dta("pclypi_wide.dta")
+pclypi_wide  <-zap_formats(pclypi_wide)
+pclypi_wide  <- zap_label(pclypi_wide)
+pclypi_wide  <- zap_labels(pclypi_wide)
+
+library(dplyr)
+
+###Create non-equivalent groups
+# Median split
+median_MD <- median(pclypi_wide$S0MORDIS, na.rm = TRUE)
+
+pclypi_wide <- pclypi_wide %>%
+  mutate(group = ifelse(S0MORDIS < median_MD, "Group1_PCL", "Group2_YPI"))
+
+
+
+# Group 1: PCL + baseline WAI
+baseline_df <- pclypi_wide %>%
+  filter(group == "Group1_PCL") %>%
+  transmute(
+    CASEID,
+    PCL = as.integer(round(S0BYPCLS)),
+    WAI = round(wai3f_0),
+    male =male
+  ) %>%
+  filter(!is.na(PCL), !is.na(WAI))
+
+# Group 2: YPI + 6-month WAI
+ypi_wai_df <- pclypi_wide %>%
+  filter(group == "Group2_YPI") %>%
+  transmute(
+    CASEID,
+    YPI = as.integer(round(S1YPI)),
+    WAI = round(wai3f_1),
+    male = male
+  ) %>%
+  filter(!is.na(YPI), !is.na(WAI))
+
+
+#PCL, WAI
+
+pclfreq <- freqtab(baseline_df[,c("PCL", "WAI")], scales=list(0:40, 22:110))
+ypifreq <- freqtab(ypi_wai_df[,c("YPI", "WAI")], scales=list(50:200, 22:110))
+
+#Plot PCL with WAI
+
+plot(pclfreq, xlab="PCL-YV", ylab="WAI", main = "PCL-YV vs. WAI Scores")
+
+
+#Plot YPI with WAI
+
+plot(ypifreq, xlab="YPI", ylab="WAI", main="YPI vs. WAI")
+
+
+##Do presmoothing here
+pclfreq_smooth <- presmoothing(~poly(total, 2, raw=TRUE) + poly(anchor, 2, raw=TRUE) + total:anchor, data=pclfreq)
+plot(pclfreq_smooth, xlab="PCL-YV", ylab="WAI", main = "PCL-YV vs. WAI Scores")
+
+
+ypifreq_smooth <- presmoothing(~poly(total, 2, raw=TRUE) + poly(anchor, 2, raw=TRUE) + total:anchor, data=ypifreq)
+plot(ypifreq_smooth, xlab="YPI", ylab="WAI", main="YPI vs. WAI")
+
+###
+#try stepwise
+# pclfreq_stepup <- presmoothing(pclfreq, smoothmethod = "loglinear", degrees=list(2,2), c(1,1), compare=TRUE)
+# ypifreq_stepup <- presmoothing(ypifreq, smoothmethod = "loglinear", degrees=list(2,2), c(1,1), compare=TRUE)
+
+#NEAT model
+neat_freq_est <- equate(pclfreq, ypifreq, type = "equip", method = "frequency estimation", smooth = "none", boot=TRUE)
+
+#Calculate confidence intervals
+# Add 95% confidence intervals to the concordance table
+# Add 95% confidence intervals and round to 2 decimals
+concordance_ci <- neat_freq_est$concordance %>%
+  mutate(
+    lower_ci = yx - 1.96 * se.b,
+    upper_ci = yx + 1.96 * se.b
+  ) %>%
+  transmute(
+    scale      = round(scale, 2),
+    yx         = round(yx, 2),
+    lower_ci   = round(lower_ci, 2),
+    upper_ci   = round(upper_ci, 2)
+  )
+
+# Preview the first rows
+print(as.data.frame(concordance_ci))
+
+
+
+
+###############Get Percentile####################
+# Function to calculate percentile of a given score
+get_percentile <- function(df, var, score) {
+  values <- df %>% pull(!!sym(var))
+  ecdf_fun <- ecdf(values[!is.na(values)])
+  percentile <- ecdf_fun(score) * 100
+  return(percentile)
+}
+
+pcl_percentile_30 <- get_percentile(pclypi_wide, "S0BYPCLS", 30)
+cat("Percentile of PCL score 30 at baseline:", pcl_percentile_30, "\n")
+
+# Percentile of YPI = 153
+ypi_percentile_150 <- get_percentile(pclypi_wide, "S1YPI", 150)
+cat("Percentile of YPI score 150 at 6 months:", ypi_percentile_150, "\n")
+
+######################Predicted vs Actual Values##############
+library(dplyr)
+
+# 1) Extract concordance and build forward/inverse mapping functions
+conc <- neat_freq_est$concordance %>%
+  transmute(PCL = as.numeric(scale),    # PCL scores at which equate is evaluated
+            YPIeq = as.numeric(yx))     # equated YPI (continuous)
+
+# Forward: PCL -> YPI_hat
+# (order by PCL to be safe; rule=2 = linear extrapolation at ends)
+conc_fwd  <- conc %>% arrange(PCL)
+fwd_fun   <- approxfun(x = conc_fwd$PCL,  y = conc_fwd$YPIeq, method = "linear", rule = 2)
+
+# Inverse: YPI -> PCL_hat (order by YPIeq; ties averaged)
+conc_inv  <- conc %>% arrange(YPIeq)
+inv_fun   <- approxfun(x = conc_inv$YPIeq, y = conc_inv$PCL,   method = "linear", ties = mean, rule = 2)
+
+# Helper to clamp to valid score ranges
+clamp <- function(x, lo, hi) pmin(hi, pmax(lo, x))
+
+# 2) Group 1: predict YPI at 6m from baseline PCL
+group1 <- pclypi_wide %>%
+  filter(group == "Group1_PCL") %>%
+  transmute(
+    CASEID,
+    PCL         = as.numeric(S0BYPCLS),
+    YPI_actual  = as.numeric(S1YPI),
+    YPI_hat_cts = fwd_fun(PCL),                          # continuous prediction
+    YPI_hat     = clamp(round(YPI_hat_cts), 50, 200),    # round, then clamp to YPI range
+    error       = YPI_hat - YPI_actual
+  )
+
+group1_summary <- group1 %>%
+  summarise(
+    n               = sum(is.finite(error)),
+    mean_error      = mean(error, na.rm = TRUE),
+    rmse            = sqrt(mean(error^2, na.rm = TRUE)),
+    cor_pred_actual = cor(YPI_hat, YPI_actual, use = "complete.obs")
+  )
+
+# 3) Group 2: predict baseline PCL from YPI at 6m
+group2 <- pclypi_wide %>%
+  filter(group == "Group2_YPI") %>%
+  transmute(
+    CASEID,
+    YPI         = as.numeric(S1YPI),
+    PCL_actual  = as.numeric(S0BYPCLS),
+    PCL_hat_cts = inv_fun(YPI),                          # continuous inverse prediction
+    PCL_hat     = clamp(round(PCL_hat_cts), 0, 40),      # round, then clamp to PCL range
+    error       = PCL_hat - PCL_actual
+  )
+
+group2_summary <- group2 %>%
+  summarise(
+    n               = sum(is.finite(error)),
+    mean_error      = mean(error, na.rm = TRUE),
+    rmse            = sqrt(mean(error^2, na.rm = TRUE)),
+    cor_pred_actual = cor(PCL_hat, PCL_actual, use = "complete.obs")
+  )
+
+# 4) Inspect
+print(head(group1, 10))
+print(group1_summary)
+
+print(head(group2, 10))
+print(group2_summary)
+
+########################Benchmark: Correlation of YPI from one wave to another#####
+########################Restrict only to YPIs separated every six months######(S1-S6)
+ypi_series <- read_dta("YPI__series_by_six_months.dta")
+ypi_series  <-zap_formats(ypi_series)
+ypi_series  <- zap_label(ypi_series)
+ypi_series  <- zap_labels(ypi_series)
+library(dplyr)
+
+# Vector of YPI wave variable names
+ypi_vars <- paste0("S", 1:6, "YPI")
+
+# Function to compute pairwise correlations between adjacent waves
+library(purrr)
+
+cor_by_wavepair <- map2_dfr(
+  ypi_vars[-length(ypi_vars)],  # from wave
+  ypi_vars[-1],                 # to wave
+  ~ {
+    vals <- ypi_series %>%
+      select(all_of(c(.x, .y))) %>%
+      filter(!is.na(.data[[.x]]), !is.na(.data[[.y]]))
+    
+    tibble(
+      wave_from = .x,
+      wave_to   = .y,
+      n_pairs   = nrow(vals),
+      cor_adj   = cor(vals[[.x]], vals[[.y]], use = "complete.obs")
+    )
+  }
+)
+
+print(cor_by_wavepair)
+
+#############################Construct 95% CIs of Correlations############
+# Function to compute 95% CI for correlation
+cor_ci <- function(r, n, conf.level = 0.95) {
+  if (n <= 3) return(c(NA, NA))  # too few observations
+  
+  z  <- atanh(r)                 # Fisher z-transform
+  se <- 1 / sqrt(n - 3)          # standard error
+  alpha <- 1 - conf.level
+  z_crit <- qnorm(1 - alpha/2)
+  
+  # CI on z scale
+  ci_z <- c(z - z_crit * se, z + z_crit * se)
+  
+  # Transform back to r
+  ci_r <- tanh(ci_z)
+  return(ci_r)
+}
+
+# Example applied to your results
+cor_results <- tibble::tribble(
+  ~wave_from, ~wave_to, ~n_pairs, ~cor_adj,
+  "S1YPI", "S2YPI", 1042, 0.578,
+  "S2YPI", "S3YPI", 1193, 0.626,
+  "S3YPI", "S4YPI", 1164, 0.638,
+  "S4YPI", "S5YPI", 1178, 0.623,
+  "S5YPI", "S6YPI", 1190, 0.658
+) %>%
+  rowwise() %>%
+  mutate(ci = list(cor_ci(cor_adj, n_pairs))) %>%
+  tidyr::unnest_wider(ci, names_sep = "_") %>%
+  rename(ci_lower = ci_1, ci_upper = ci_2)
+
+print(cor_results)
+
+############################Create Confidence Intervals of Groups 1 and Group 2 Predicted and Actual
+
+# Function to compute correlation and CI
+cor_with_ci <- function(x, y, conf.level = 0.95) {
+  # Remove missing
+  complete_idx <- complete.cases(x, y)
+  x <- x[complete_idx]
+  y <- y[complete_idx]
+  
+  n <- length(x)
+  r <- cor(x, y)
+  
+  if (n <= 3) {
+    return(tibble(cor = r, ci_lower = NA, ci_upper = NA, n = n))
+  }
+  
+  # Fisher z-transform
+  z  <- atanh(r)
+  se <- 1 / sqrt(n - 3)
+  alpha <- 1 - conf.level
+  z_crit <- qnorm(1 - alpha/2)
+  
+  ci_z <- c(z - z_crit * se, z + z_crit * se)
+  ci_r <- tanh(ci_z)
+  
+  tibble(cor = r, ci_lower = ci_r[1], ci_upper = ci_r[2], n = n)
+}
+
+# --- Group 1: YPI_actual vs YPI_hat ---
+group1_cor_ci <- cor_with_ci(group1$YPI_actual, group1$YPI_hat)
+
+# --- Group 2: PCL_actual vs PCL_hat ---
+group2_cor_ci <- cor_with_ci(group2$PCL_actual, group2$PCL_hat)
+
+# Print results
+print(group1_cor_ci)
+print(group2_cor_ci)
+
+###########################pclypi no anchor#####################
+library(equate)
+
+# Create a joint frequency table for the single-group design
+# Using your pclypi_wide data with S0BYPCLS (PCL) and S1YPI (YPI)
+
+pclypi_sg <- freqtab(
+  pclypi_wide[, c("S0BYPCLS", "S1YPI")],
+  scales = list(0:40, 50:200),   # explicit ranges for PCL and YPI
+  design = "sg"
+)
+
+# Perform equipercentile equating with loglinear smoothing
+# lowp stabilizes the tails when tests differ in length
+sg_eq <- equate(
+  pclypi_sg,
+  type   = "equip",
+  smooth = "loglin",
+  lowp   = c(0, 50)   # adjust these as needed
+)
+
+summary(sg_eq)
+plot(sg_eq)
+
+sg_eq$concordance
+
+
+
+###################Identify Region of PCL-SV that YPI is most Informative
+
+#First reverse SG design YPI-PCL_hat
+
+
+ypipcl_sg <- freqtab(
+  pclypi_wide[, c("S1YPI","S0BYPCLS")],
+  scales = list(50:200, 0:40),   # explicit ranges for PCL and YPI
+  design = "sg"
+)
+
+# Perform equipercentile equating with loglinear smoothing
+# lowp stabilizes the tails when tests differ in length
+sg_eq_rev <- equate(
+  ypipcl_sg,
+  type   = "equip",
+  smooth = "loglin",
+  lowp   = c(50,0)   # adjust these as needed
+)
+
+summary(sg_eq_rev)
+plot(sg_eq_rev)
+
+sg_eq_rev$concordance
+
+library(dplyr)
+library(dplyr)
+library(ggplot2)
+
+# 1. Extract concordance mapping
+concordance <- sg_eq_rev$concordance %>%
+  transmute(S1YPI = as.integer(scale),  # YPI score
+            PCL_hat = yx)               # predicted PCL score
+
+# 2. Merge with observed PCL
+merged <- pclypi_wide %>%
+  select(CASEID, S1YPI, PCL_actual = S0BYPCLS) %>%
+  inner_join(concordance, by = "S1YPI") %>%
+  filter(!is.na(PCL_actual), !is.na(PCL_hat))
+
+# 3. Bin actual PCL into 5-point increments
+merged <- merged %>%
+  mutate(PCL_bin = cut(PCL_actual, breaks = seq(0, 40, 5), include.lowest = TRUE))
+
+# 4. Compute stats within bins
+bin_stats <- merged %>%
+  group_by(PCL_bin) %>%
+  summarise(
+    n        = n(),
+    cor_bin  = ifelse(n > 2, cor(PCL_actual, PCL_hat), NA_real_),
+    rmse_bin = ifelse(n > 0, sqrt(mean((PCL_actual - PCL_hat)^2)), NA_real_),
+    .groups = "drop"
+  )
+
+print(bin_stats, n = nrow(bin_stats))
+
+# 5. Plot correlations by bin
+ggplot(bin_stats, aes(x = PCL_bin, y = cor_bin, group = 1)) +
+  geom_line(color = "steelblue", size = 1.2) +
+  geom_point(size = 2, color = "steelblue") +
+  theme_minimal(base_size = 14) +
+  labs(title = "Correlation of Predicted vs Actual PCL by 5-Point Bins",
+       x = "PCL Bin", y = "Correlation") +
+  ylim(-1, 1) +
+  geom_hline(yintercept = 0, linetype = "dashed")
+
+# 6. Plot RMSE by bin
+ggplot(bin_stats, aes(x = PCL_bin, y = rmse_bin, group = 1)) +
+  geom_line(color = "tomato", size = 1.2) +
+  geom_point(size = 2, color = "tomato") +
+  theme_minimal(base_size = 14) +
+  labs(title = "RMSE of Predicted vs Actual PCL by 5-Point Bins",
+       x = "PCL Bin", y = "RMSE")
+
+library(dplyr)
+
+# Function to compute correlation with CI
+cor_ci <- function(x, y, conf.level = 0.95) {
+  x <- x[!is.na(x) & !is.na(y)]
+  y <- y[!is.na(x) & !is.na(y)]
+  n <- length(x)
+  if (n < 4) {
+    return(data.frame(cor = NA, ci_lower = NA, ci_upper = NA, n = n))
+  }
+  
+  r <- cor(x, y)
+  zr <- atanh(r)  # Fisher z
+  se <- 1 / sqrt(n - 3)
+  alpha <- 1 - conf.level
+  zcrit <- qnorm(1 - alpha/2)
+  ci_lower <- tanh(zr - zcrit * se)
+  ci_upper <- tanh(zr + zcrit * se)
+  
+  data.frame(cor = r, ci_lower = ci_lower, ci_upper = ci_upper, n = n)
+}
+
+# Join predicted values (sg_eq_rev$concordance) to wide data
+concordance_df <- sg_eq_rev$concordance %>%
+  transmute(S1YPI = scale, PCL_hat = round(yx))
+
+merged_df <- pclypi_wide %>%
+  filter(!is.na(S1YPI), !is.na(S0BYPCLS)) %>%
+  left_join(concordance_df, by = "S1YPI") %>%
+  rename(PCL_actual = S0BYPCLS)
+
+# Bin actual PCL scores into 5-point intervals
+merged_df <- merged_df %>%
+  mutate(PCL_bin = cut(PCL_actual, breaks = seq(0, 40, by = 5), include.lowest = TRUE))
+
+
+library(dplyr)
+library(tidyr)
+
+# Safe correlation + Fisher z CI
+cor_ci <- function(x, y, conf.level = 0.95) {
+  mask <- is.finite(x) & is.finite(y)
+  x <- x[mask]; y <- y[mask]
+  n <- length(x)
+  if (n < 4 || sd(x) == 0 || sd(y) == 0) {
+    return(tibble(cor = NA_real_, ci_lower = NA_real_, ci_upper = NA_real_, n = n))
+  }
+  r  <- cor(x, y)
+  zr <- atanh(pmin(pmax(r, -0.999999), 0.999999))
+  se <- 1 / sqrt(n - 3)
+  z  <- qnorm(0.975)  # 95% CI
+  tibble(
+    cor      = r,
+    ci_lower = tanh(zr - z * se),
+    ci_upper = tanh(zr + z * se),
+    n        = n
+  )
+}
+
+# Collapse (30,35] and (35,40] → (30,40], keep 5-pt bins below 30
+group2_bins_ci <- merged_df %>%
+  mutate(
+    PCL_bin_collapsed = if_else(
+      PCL_actual > 30,
+      "(30,40]",
+      as.character(cut(PCL_actual,
+                       breaks = seq(0, 30, by = 5),
+                       include.lowest = TRUE, right = TRUE))
+    )
+  ) %>%
+  group_by(PCL_bin_collapsed) %>%
+  summarise(res = list(cor_ci(PCL_hat, PCL_actual)), .groups = "drop") %>%
+  unnest(res) %>%
+  # Optional: order bins nicely
+  mutate(PCL_bin_collapsed = factor(
+    PCL_bin_collapsed,
+    levels = c("[0,5]", "(5,10]", "(10,15]", "(15,20]",
+               "(20,25]", "(25,30]", "(30,40]")
+  )) %>%
+  arrange(PCL_bin_collapsed)
+
+print(group2_bins_ci, n = nrow(group2_bins_ci))
+
+#######################Correlate the Concordance Tables of Single Group and NEAT design#######
+
+library(dplyr)
+library(dplyr)
+library(ggplot2)
+
+## 1) SG concordance: YPI -> PCL
+sg_tbl <- sg_eq_rev$concordance %>%
+  transmute(YPI = scale, PCL_hat_sg = yx)
+
+## 2) Invert the NEAT mapping (currently PCL -> YPI) to YPI -> PCL
+##    Build an interpolation function PCL = f(YPI)
+neat_xy <- neat_freq_est$concordance %>%
+  transmute(PCL = scale, YPI = yx) %>%
+  arrange(YPI) %>%
+  filter(is.finite(YPI)) %>%
+  distinct(YPI, .keep_all = TRUE)   # drop any duplicate YPI rows, keep one
+
+f_neat_inv <- approxfun(neat_xy$YPI, neat_xy$PCL, rule = 2)  # linear interpolation, extrapolate at ends
+
+neat_tbl <- tibble(
+  YPI = sg_tbl$YPI,
+  PCL_hat_neat = f_neat_inv(sg_tbl$YPI)
+)
+
+## 3) Merge and keep complete cases
+cmp <- sg_tbl %>%
+  left_join(neat_tbl, by = "YPI")
+
+use <- is.finite(cmp$PCL_hat_sg) & is.finite(cmp$PCL_hat_neat)
+stopifnot(sum(use) >= 4)
+
+## 4) Correlation + 95% CI (Fisher z)
+r <- cor(cmp$PCL_hat_sg[use], cmp$PCL_hat_neat[use])
+n <- sum(use)
+z <- atanh(r)
+se <- 1 / sqrt(n - 3)
+zcrit <- qnorm(0.975)
+ci_lo <- tanh(z - zcrit * se)
+ci_hi <- tanh(z + zcrit * se)
+
+cat("Correlation (SG vs NEAT, both YPI→PCL):", round(r, 3), "\n")
+cat("95% CI:", round(ci_lo, 3), "to", round(ci_hi, 3), "\n")
+cat("Pairs used:", n, "\n")
+
+## 5) Quick diagnostic plot
+ggplot(cmp[use, ], aes(x = PCL_hat_sg, y = PCL_hat_neat)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(x = "Equated PCL from SG (YPI→PCL)",
+       y = "Equated PCL from NEAT (YPI→PCL, inverted)",
+       title = "Agreement of Equated Score Functions (SG vs NEAT)") +
+  theme_minimal(base_size = 13)
+
+#######################Collapse Bins to Recover Group 2 correlation##############
+library(dplyr)
+library(rlang)
+
+# --- 1) Helper: Fisher z CI for Pearson r ---
+cor_ci <- function(x, y, conf.level = 0.95) {
+  ok   <- is.finite(x) & is.finite(y)
+  x    <- x[ok]; y <- y[ok]
+  n    <- length(x)
+  r    <- suppressWarnings(cor(x, y))  # Pearson
+  z    <- atanh(r)
+  se   <- 1 / sqrt(n - 3)
+  zcrit <- qnorm(1 - (1 - conf.level) / 2)
+  lo   <- tanh(z - zcrit * se)
+  hi   <- tanh(z + zcrit * se)
+  tibble(cor = r, ci_lower = lo, ci_upper = hi, n = n)
+}
+
+# --- 2) Overall correlation from single-group equating (merged_df) ---
+# Assumes merged_df has columns: PCL_actual, PCL_hat
+overall_cor_ci <- cor_ci(merged_df$PCL_hat, merged_df$PCL_actual)
+cat("Overall (collapsed bins) correlation & 95% CI (PCL_hat vs PCL_actual):\n")
+print(overall_cor_ci)
+
+# --- 3) Compare to your NEAT Group 2 correlation (if object exists) ---
+if (exists("group2")) {
+  # group2 expected columns: PCL_actual, PCL_hat
+  group2_cor_ci <- cor_ci(group2$PCL_hat, group2$PCL_actual)
+  cat("\nGroup 2 (NEAT) correlation & 95% CI (PCL_hat vs PCL_actual):\n")
+  print(group2_cor_ci)
+} else {
+  cat("\nNote: 'group2' not found in the workspace; skipped NEAT comparison.\n")
+}
+
+save.image("C:/Users/llb296/OneDrive - University of Saskatchewan/Pathways/Oct_2025/equate_october.RData")
+
